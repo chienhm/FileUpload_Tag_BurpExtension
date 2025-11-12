@@ -520,7 +520,6 @@ Content-Type: application/json
 ```
 
 **Kết quả:**
-- Extension hiển thị 3 tags riêng biệt
 - Chọn 3 files khác nhau
 - Tất cả được encode base64 và Content-Type tự động điền
 
