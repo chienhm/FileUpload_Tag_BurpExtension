@@ -650,7 +650,6 @@ class FileUploadTagEditorTab(IMessageEditorTab):
         infoArea = JTextArea(referenceText)
         infoArea.setFont(Font("Monospaced", Font.PLAIN, 11))
         infoArea.setEditable(False)
-        infoArea.setBackground(Color(245, 245, 245))
         infoArea.setCaretPosition(0)
         
         infoScrollPane = JScrollPane(infoArea)
