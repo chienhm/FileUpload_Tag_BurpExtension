@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
-from burp import IBurpExtender, IHttpListener, IMessageEditorTabFactory, IMessageEditorTab
-from javax.swing import (JPanel, JButton, JTextArea, JScrollPane, JFileChooser, JOptionPane, BorderFactory)
+from burp import IBurpExtender, IHttpListener, IMessageEditorTabFactory, IMessageEditorTab, ITab
+from javax.swing import (JPanel, JButton, JTextArea, JScrollPane, JFileChooser, JOptionPane, 
+                         BorderFactory, JTable, JLabel, SwingConstants, Box, BoxLayout, JSplitPane)
+from javax.swing.table import DefaultTableModel, DefaultTableCellRenderer
 from javax.swing.border import EmptyBorder
-from java.awt import BorderLayout, Dimension, Color, Font
+from java.awt import BorderLayout, Dimension, Color, Font, GridLayout, FlowLayout
+from java.awt.event import MouseAdapter
 from java.io import FileInputStream, File as JFile
 import re
 
@@ -14,11 +17,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory):
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
-        callbacks.setExtensionName("File Upload Tag")
-        
-        # Don't add main tab - only use the File Tags tab in Repeater
-        # self.initGUI()
-        # callbacks.addSuiteTab(self)
+        callbacks.setExtensionName("File Upload Tag Manager")
         
         # Register HTTP listener to process requests
         callbacks.registerHttpListener(self)
@@ -88,6 +87,17 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory):
         print("Extension ready! Go to Repeater -> File Tags tab to get started.")
         print("=" * 70)
     
+    def formatBytes(self, size):
+        """Format file size in human readable format"""
+        if size < 1024:
+            return str(size) + " B"
+        elif size < 1024 * 1024:
+            return str(round(size / 1024.0, 2)) + " KB"
+        elif size < 1024 * 1024 * 1024:
+            return str(round(size / (1024.0 * 1024), 2)) + " MB"
+        else:
+            return str(round(size / (1024.0 * 1024 * 1024), 2)) + " GB"
+    
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         # Only process requests
         if not messageIsRequest:
@@ -107,10 +117,10 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory):
             matches = list(re.finditer(pattern, requestStr))
             
             # Also find typefile tags for Content-Type replacement
-            typefilePattern = r'<@(typefile\d*)@>'
+            typefilePattern = r'<@(typefile\d*)(?::([a-zA-Z0-9]+))?@>'
             typefileMatches = list(re.finditer(typefilePattern, requestStr))
             
-            if len(matches) == 0:
+            if len(matches) == 0 and len(typefileMatches) == 0:
                 return
             
             modified = False
@@ -174,26 +184,53 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory):
                 except Exception as e:
                     print("ERROR: Failed to process file for " + info['tag'] + ": " + str(e))
             
-            # Now replace ALL typefile tags in the updated request
-            # If same typefile tag appears multiple times, all get same Content-Type
-            # E.g., multiple <@typefile@> all get Content-Type from getfile@
+            # Update requestStr after getfile replacements to ensure correct offsets/content for typefile
             requestStr = self._helpers.bytesToString(newRequest)
             
-            # Build a mapping of typefile tags to Content-Type
-            typefileMapping = {}
-            for info in getfileInfos:
-                typefileTag = "<@typefile" + info['paramName'].replace("getfile", "") + "@>"
-                contentType = self.getContentType(info['filePath'])
-                typefileMapping[typefileTag] = contentType
+            # Now replace ALL typefile tags in the updated request
+            # Support both auto-detection <@typefile@> and explicit extension <@typefile:php@>
             
-            # Replace all occurrences of each typefile tag
-            for typefileTag, contentType in typefileMapping.items():
-                # Replace ALL occurrences of this tag (not just first)
-                while typefileTag in requestStr:
-                    contentTypeBytes = self._helpers.stringToBytes(contentType)
-                    newRequest = self.replaceInRequest(newRequest, typefileTag, contentTypeBytes)
-                    requestStr = self._helpers.bytesToString(newRequest)
-                    modified = True
+            # Find all typefile tags: <@typefile[digits][:extension]@>
+            typefilePattern = r'<@(typefile\d*)(?::([^@]+))?@>'
+            typefileMatches = list(re.finditer(typefilePattern, requestStr))
+            
+            # Get unique tags to process
+            uniqueTypefileTags = set()
+            for m in typefileMatches:
+                uniqueTypefileTags.add(m.group(0))
+            
+            for tag in uniqueTypefileTags:
+                # Parse tag again to get details
+                match = re.match(typefilePattern, tag)
+                if match:
+                    baseName = match.group(1) # e.g. typefile, typefile1
+                    overrideExt = match.group(2) # e.g. php, or None
+                    
+                    contentType = None
+                    
+                    if overrideExt:
+                        # Case 1: Explicit extension override
+                        # We pass a dummy filename with that extension to getContentType
+                        contentType = self.getContentType("dummy." + overrideExt)
+                    else:
+                        # Case 2: Auto-detect from corresponding getfile
+                        # We need to find which getfile corresponds to this typefile
+                        # typefile -> getfile, typefile1 -> getfile1
+                        getfileParamName = baseName.replace("typefile", "getfile")
+                        
+                        # Find this param in getfileInfos
+                        for info in getfileInfos:
+                            if info['paramName'] == getfileParamName:
+                                contentType = self.getContentType(info['filePath'])
+                                break
+                    
+                    if contentType:
+                        # Replace ALL occurrences of this specific tag
+                        while tag in requestStr:
+                            contentTypeBytes = self._helpers.stringToBytes(contentType)
+                            newRequest = self.replaceInRequest(newRequest, tag, contentTypeBytes)
+                            requestStr = self._helpers.bytesToString(newRequest)
+                            modified = True
             
             # Update request if modified
             if modified:
@@ -501,6 +538,18 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory):
         return FileUploadTagEditorTab(self, controller, editable)
 
 
+class NonEditableModel(DefaultTableModel):
+    def isCellEditable(self, row, column):
+        return False
+
+class DoubleClickListener(MouseAdapter):
+    def __init__(self, action_listener):
+        self.action_listener = action_listener
+    
+    def mouseClicked(self, event):
+        if event.getClickCount() == 2:
+            self.action_listener(event)
+
 class FileUploadTagEditorTab(IMessageEditorTab):
     """Custom editor tab to show which tags will be replaced"""
     
@@ -509,88 +558,132 @@ class FileUploadTagEditorTab(IMessageEditorTab):
         self._controller = controller
         self._editable = editable
         self._currentMessage = None
-        self._currentParams = []
         
         # Create UI
-        self.panel = JPanel(BorderLayout())
+        self.panel = JPanel(BorderLayout(10, 10))
+        self.panel.setBorder(EmptyBorder(10, 10, 10, 10))
         
-        # Text area for info
-        self._txtInput = extender._callbacks.createTextEditor()
-        self.panel.add(self._txtInput.getComponent(), BorderLayout.CENTER)
+        # Table
+        self.tableModel = NonEditableModel(
+            ["Tag Name", "File Path", "File Size", "Content-Type", "Status"], 0
+        )
+        self.table = JTable(self.tableModel)
+        self.table.addMouseListener(DoubleClickListener(self.reloadFile))
+        self.table.setRowHeight(25)
+        self.table.setFont(Font("Monospaced", Font.PLAIN, 12))
+        self.table.getTableHeader().setFont(Font("Dialog", Font.BOLD, 12))
+        
+        # Selection listener
+        self.table.getSelectionModel().addListSelectionListener(self.onSelectionChanged)
+        
+        tableScrollPane = JScrollPane(self.table)
+        
+        # Reference Info
+        referenceText = (
+            "CONTENT-TYPE MAPPING REFERENCE (Used by <@typefile@> tags):\n"
+            "-----------------------------------------------------------------------------------\n"
+            " PHP         : .php, .php2-7, .pht, .phtm -> application/x-httpd-php\n"
+            "               .phps -> application/x-httpd-php-source\n"
+            "               .phtml, .shtml -> text/html | .pgif -> image/gif\n"
+            "               .phar -> application/octet-stream | .inc, .htaccess -> text/plain\n"
+            "\n"
+            " ASP/.NET    : .asp, .aspx, .aspq -> text/asp\n"
+            "               .ashx, .asmx, .axd, .asa, .rem -> text/plain\n"
+            "               .config -> application/xml | .cer -> application/x-x509-ca-cert\n"
+            "               .cshtm, .cshtml, .vbhtm, .vbhtml -> text/html\n"
+            "               .soap -> application/soap+xml\n"
+            "\n"
+            " JSP/Java    : .jsp, .jspx, .jsw, .jsv, .jspf, .wss, .do, .action -> text/html\n"
+            "               .jar -> application/java-archive\n"
+            "\n"
+            " ColdFusion  : .cfm, .cfml, .cfc, .dbm -> text/html\n"
+            " Flash       : .swf -> application/x-shockwave-flash\n"
+            " Perl        : .pl -> text/x-perl | .cgi -> text/plain\n"
+            " Erlang      : .yaws -> text/html\n"
+            "\n"
+            " Python      : .py, .py3, .pyw, .pyx, .pxd, .pxi, .pyi -> text/x-python\n"
+            "               .pyc, .pyo -> application/x-python-code\n"
+            "               .pyd -> application/octet-stream | .pyz, .pywz -> application/zip\n"
+            "               .pth -> text/plain\n"
+            "\n"
+            " Shell/Sys   : .sh -> application/x-sh | .bash -> text/x-shellscript\n"
+            "               .exe, .dll -> application/x-msdownload | .msi -> application/x-msi\n"
+            "               .bat -> application/x-bat | .ps1, .psd1, .psm1 -> text/plain\n"
+            "               .ps1xml -> text/xml | .bin -> application/octet-stream\n"
+            "\n"
+            " Web/Data    : .html, .htm -> text/html | .js -> application/javascript\n"
+            "               .xml -> application/xml | .json -> application/json\n"
+            "               .csv -> text/csv | .txt -> text/plain\n"
+            "\n"
+            " Documents   : .pdf -> application/pdf | .doc -> application/msword\n"
+            "               .docx -> application/vnd.openxmlformats-officedocument.wordprocessingml.document\n"
+            "               .xlsx -> application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\n"
+            "               .xls -> application/vnd.ms-excel\n"
+            "\n"
+            " Images      : .jpg, .jpeg -> image/jpeg | .png -> image/png | .gif -> image/gif\n"
+            "               .bmp -> image/bmp | .svg -> image/svg+xml | .ico -> image/x-icon\n"
+            "               .tif, .tiff -> image/tiff | .eps -> application/postscript\n"
+            "               .raw -> image/x-raw | .cr2 -> image/x-canon-cr2\n"
+            "               .nef -> image/x-nikon-nef | .orf -> image/x-olympus-orf\n"
+            "               .sr2 -> image/x-sony-sr2\n"
+            "\n"
+            " Audio       : .mp3 -> audio/mpeg | .wav -> audio/wav | .aac -> audio/aac\n"
+            "               .flac -> audio/flac | .ogg, .oga -> audio/ogg | .m4a -> audio/mp4\n"
+            "               .wma -> audio/x-ms-wma | .opus -> audio/opus | .weba -> audio/webm\n"
+            "               .mid, .midi -> audio/midi\n"
+            "\n"
+            " Video       : .mp4 -> video/mp4 | .avi -> video/x-msvideo | .mkv -> video/x-matroska\n"
+            "               .mov -> video/quicktime | .wmv -> video/x-ms-wmv | .flv -> video/x-flv\n"
+            "               .webm -> video/webm | .mpeg, .mpg -> video/mpeg | .m4v -> video/x-m4v\n"
+            "               .3gp -> video/3gpp | .3g2 -> video/3gpp2 | .ogv -> video/ogg\n"
+            "               .ts -> video/mp2t | .vob -> video/dvd | .asf -> video/x-ms-asf\n"
+            "               .rm -> application/vnd.rn-realmedia\n"
+            "               .rmvb -> application/vnd.rn-realmedia-vbr\n"
+            "\n"
+            " Archives    : .zip -> application/zip | .rar -> application/x-rar-compressed\n"
+            "               .tar -> application/x-tar | .gz -> application/gzip\n"
+            "               .7z -> application/x-7z-compressed\n"
+            "\n"
+            " Other       : Unknown extensions -> application/octet-stream\n"
+        )
+        
+        infoArea = JTextArea(referenceText)
+        infoArea.setFont(Font("Monospaced", Font.PLAIN, 11))
+        infoArea.setEditable(False)
+        infoArea.setBackground(Color(245, 245, 245))
+        infoArea.setCaretPosition(0)
+        
+        infoScrollPane = JScrollPane(infoArea)
+        infoPanel = JPanel(BorderLayout())
+        infoPanel.setBorder(BorderFactory.createTitledBorder("Content-Type Mapping Reference"))
+        infoPanel.add(infoScrollPane, BorderLayout.CENTER)
+        
+        # Split Pane
+        splitPane = JSplitPane(JSplitPane.VERTICAL_SPLIT, tableScrollPane, infoPanel)
+        splitPane.setResizeWeight(0.6) # Give 60% space to table by default
+        
+        self.panel.add(splitPane, BorderLayout.CENTER)
         
         # Bottom panel for buttons
-        self.buttonPanel = JPanel()
-        self.buttonPanel.setBorder(EmptyBorder(5, 5, 5, 5))
+        self.buttonPanel = JPanel(FlowLayout(FlowLayout.RIGHT))
         
-        self.selectFileButton = JButton("Select File", actionPerformed=self.reloadFile)
+        self.selectFileButton = JButton("Select/Change File", actionPerformed=self.reloadFile)
         self.selectFileButton.setEnabled(False)
-        self.selectFileButton.setPreferredSize(Dimension(200, 40))
-        self.selectFileButton.setFont(Font("Dialog", Font.BOLD, 14))
+        self.selectFileButton.setFont(Font("Dialog", Font.BOLD, 12))
         self.buttonPanel.add(self.selectFileButton)
         
         self.panel.add(self.buttonPanel, BorderLayout.SOUTH)
         
-    def reloadFile(self, event):
-        """Allow user to select a new file for a parameter"""
-        if not self._currentParams:
-            JOptionPane.showMessageDialog(self.panel, 
-                "No file tags detected in current request!", 
-                "No Tags", 
-                JOptionPane.WARNING_MESSAGE)
-            return
-        
-        # If multiple parameters, let user choose which one to update
-        if len(self._currentParams) > 1:
-            # Create a selection dialog
-            paramArray = [p for p in self._currentParams]
-            selectedParam = JOptionPane.showInputDialog(
-                self.panel,
-                "Select parameter to assign/update file:",
-                "Choose Parameter",
-                JOptionPane.QUESTION_MESSAGE,
-                None,
-                paramArray,
-                paramArray[0]
-            )
-            if not selectedParam:
-                return
-            paramName = str(selectedParam)
-        else:
-            paramName = self._currentParams[0]
-        
-        # Show file chooser
-        chooser = JFileChooser()
-        chooser.setDialogTitle("Select file for parameter: " + paramName)
-        
-        # Set initial directory if mapping exists
-        if paramName in BurpExtender.file_mappings:
-            currentFile = JFile(BurpExtender.file_mappings[paramName])
-            if currentFile.exists():
-                chooser.setCurrentDirectory(currentFile.getParentFile())
-                chooser.setSelectedFile(currentFile)
-        
-        ret = chooser.showOpenDialog(self.panel)
-        if ret == JFileChooser.APPROVE_OPTION:
-            newFile = chooser.getSelectedFile()
-            newPath = newFile.getAbsolutePath()
-            
-            # Update mapping
-            oldPath = BurpExtender.file_mappings.get(paramName, "None")
-            BurpExtender.file_mappings[paramName] = newPath
-            
-            # Refresh display
-            self.setMessage(self._currentMessage, True)
-            
-            JOptionPane.showMessageDialog(self.panel, 
-                "File Selected Successfully!\n\n" +
-                "Parameter: " + paramName + "\n" +
-                "File: " + newFile.getName() + "\n" +
-                "Size: " + self.formatBytes(newFile.length()) + "\n\n" +
-                "The tag <@" + paramName + "@> will be replaced with this file\n" +
-                "when you send the request.", 
-                "Success", 
-                JOptionPane.INFORMATION_MESSAGE)
-    
+    def onSelectionChanged(self, event):
+        if not event.getValueIsAdjusting():
+            selectedRow = self.table.getSelectedRow()
+            if selectedRow >= 0:
+                tagName = self.tableModel.getValueAt(selectedRow, 0)
+                # Only enable button for getfile tags (displayed as "getfile...", typefile tags are "<@typefile...>")
+                self.selectFileButton.setEnabled(str(tagName).startswith("getfile"))
+            else:
+                self.selectFileButton.setEnabled(False)
+
     def getTabCaption(self):
         return "File Tags"
     
@@ -600,236 +693,109 @@ class FileUploadTagEditorTab(IMessageEditorTab):
     def isEnabled(self, content, isRequest):
         if not isRequest:
             return False
-        
-        # Check if content contains any file upload tags (getfile pattern only)
-        contentStr = self._extender._helpers.bytesToString(content)
-        pattern = r'<@(getfile\d*)(?::([^@]+))?@>'
-        typefilePattern = r'<@(typefile\d*)@>'
-        return re.search(pattern, contentStr) is not None or re.search(typefilePattern, contentStr) is not None
+        # Check if content has tags
+        if content:
+            request_str = self._extender._helpers.bytesToString(content)
+            return "<@getfile" in request_str or "<@typefile" in request_str
+        return False
     
     def setMessage(self, content, isRequest):
         self._currentMessage = content
-        self._currentParams = []
+        if not isRequest or not content:
+            self.tableModel.setRowCount(0)
+            return
+            
+        request_str = self._extender._helpers.bytesToString(content)
         
-        if content is None:
-            self._txtInput.setText(None)
-            self.selectFileButton.setEnabled(False)
+        # Find tags
+        # Find all <@getfile...@> tags
+        # We want to capture the base tag name (e.g. getfile, getfile1) ignoring :base64
+        matches = re.findall(r'<@(getfile\d*)(?::[a-zA-Z0-9_]+)?@>', request_str)
+        
+        unique_tags = sorted(list(set(matches)))
+        
+        self.tableModel.setRowCount(0)
+        
+        for tag in unique_tags:
+            path = BurpExtender.file_mappings.get(tag, "")
+            
+            status = "Not Mapped"
+            fileSize = ""
+            contentType = ""
+            
+            if path:
+                jfile = JFile(path)
+                if jfile.exists():
+                    status = "Ready"
+                    fileSize = self._extender.formatBytes(jfile.length())
+                    contentType = self._extender.getContentType(path)
+                else:
+                    status = "File Not Found"
+            
+            self.tableModel.addRow([tag, path, fileSize, contentType, status])
+            
+        # Handle typefile tags
+        typefile_matches = re.findall(r'<@(typefile\d*)(?::([^@]+))?@>', request_str)
+        
+        processed_typefiles = set()
+        
+        for base_name, extension in typefile_matches:
+            full_tag = "<@" + base_name + (":" + extension if extension else "") + "@>"
+            
+            if full_tag in processed_typefiles:
+                continue
+            processed_typefiles.add(full_tag)
+            
+            if extension:
+                # Static typefile (e.g. <@typefile:php@>)
+                ctype = self._extender.getContentType("dummy." + extension)
+                self.tableModel.addRow([full_tag, "(Static Type)", "-", ctype, "Ready"])
+            else:
+                # Dynamic typefile (e.g. <@typefile@>)
+                corresponding_getfile = base_name.replace("typefile", "getfile")
+                
+                if corresponding_getfile not in unique_tags:
+                    self.tableModel.addRow([full_tag, "Missing Dependency", "-", "-", "Error: Needs <@" + corresponding_getfile + "@>"])
+            
+    def reloadFile(self, event):
+        """Allow user to select a new file for a parameter"""
+        selectedRow = self.table.getSelectedRow()
+        if selectedRow < 0:
+            return
+            
+        tagName = self.tableModel.getValueAt(selectedRow, 0)
+        
+        # Only allow file selection for getfile tags
+        if not str(tagName).startswith("getfile"):
             return
         
-        # Highlight tags in the message
-        contentStr = self._extender._helpers.bytesToString(content)
-        pattern = r'<@(getfile\d*)(?::([^@]+))?@>'
-        typefilePattern = r'<@(typefile\d*)@>'
+        # Show file chooser
+        chooser = JFileChooser()
+        chooser.setDialogTitle("Select file for tag: " + tagName)
         
-        infoText = "=" * 70 + "\n"
-        infoText += "   FILE UPLOAD TAGS DETECTED\n"
-        infoText += "=" * 70 + "\n\n"
-        matches = re.finditer(pattern, contentStr)
+        # Set initial directory if mapping exists
+        currentPath = self.tableModel.getValueAt(selectedRow, 1)
+        if currentPath and JFile(currentPath).exists():
+            chooser.setSelectedFile(JFile(currentPath))
         
-        # Also detect typefile tags
-        typefileMatches = list(re.finditer(typefilePattern, contentStr))
-        typefileParams = {}
-        for match in typefileMatches:
-            typefileParam = match.group(1)
-            typefileParams[typefileParam] = match.group(0)
-        
-        foundTags = 0
-        for match in matches:
-            foundTags += 1
-            foundTags = True
-            paramName = match.group(1)
-            encoding = match.group(2) if match.group(2) else "raw"
-            tag = match.group(0)
+        ret = chooser.showOpenDialog(self.panel)
+        if ret == JFileChooser.APPROVE_OPTION:
+            f = chooser.getSelectedFile()
+            filePath = f.getAbsolutePath()
             
-            # Add to current params list
-            if paramName not in self._currentParams:
-                self._currentParams.append(paramName)
+            # Update mapping
+            BurpExtender.file_mappings[tagName] = filePath
             
-                if paramName in BurpExtender.file_mappings:
-                    filePath = BurpExtender.file_mappings[paramName]
-                    jfile = JFile(filePath)
-                    fileSize = jfile.length() if jfile.exists() else 0
-                    fileExists = jfile.exists()
-                    
-                    # Check if there's a corresponding typefile tag
-                    typefileParam = "typefile" + paramName.replace("getfile", "")
-                    hasTypefileTag = typefileParam in typefileParams
-                    
-                    infoText += "[" + str(foundTags) + "] Tag: " + tag + "\n"
-                    infoText += "    " + "-" * 60 + "\n"
-                    infoText += "    Parameter : " + paramName + "\n"
-                    infoText += "    File Path : " + filePath + "\n"
-                    
-                    if fileExists:
-                        infoText += "    File Size : " + self.formatBytes(fileSize) + "\n"
-                        contentType = self._extender.getContentType(filePath)
-                        infoText += "    Content-Type : " + contentType + "\n"
-                        if hasTypefileTag:
-                            infoText += "    Type Tag  : " + typefileParams[typefileParam] + " (will auto-replace)\n"
-                        infoText += "    Status    : READY (file exists)\n"
-                    else:
-                        infoText += "    File Size : N/A\n"
-                        infoText += "    Status    : WARNING - File not found!\n"
-                    
-                    infoText += "    Encoding  : " + encoding + "\n"
-                    infoText += "\n"
-                else:
-                    # Check if there's a corresponding typefile tag
-                    typefileParam = "typefile" + paramName.replace("getfile", "")
-                    hasTypefileTag = typefileParam in typefileParams
-                    
-                    infoText += "[" + str(foundTags) + "] Tag: " + tag + "\n"
-                    infoText += "    " + "-" * 60 + "\n"
-                    infoText += "    Parameter : " + paramName + "\n"
-                    if hasTypefileTag:
-                        infoText += "    Type Tag  : " + typefileParams[typefileParam] + " (will auto-fill)\n"
-                    infoText += "    Status    : NOT CONFIGURED - Click button below to select file\n"
-                    infoText += "    Encoding  : " + encoding + "\n"
-                    infoText += "\n"
-        
-        if foundTags == 0:
-            infoText = "=" * 70 + "\n"
-            infoText += "   FILE UPLOAD TAG - NO TAGS DETECTED\n"
-            infoText += "=" * 70 + "\n\n"
-            infoText += "How to use:\n\n"
-            infoText += "  1. Add a tag to your request body:\n\n"
-            infoText += "     Examples:\n"
-            infoText += "       <@getfile@>          - Upload file as raw binary\n"
-            infoText += "       <@getfile1@>         - Upload second file as raw binary\n"
-            infoText += "       <@getfile:base64@>   - Upload file encoded in base64\n"
-            infoText += "       <@getfile2:base64@>  - Upload third file encoded in base64\n\n"
-            infoText += "     Content-Type auto-detection:\n"
-            infoText += "       <@typefile@>         - Auto-fill Content-Type for getfile\n"
-            infoText += "       <@typefile1@>        - Auto-fill Content-Type for getfile1\n"
-            infoText += "       <@typefile2@>        - Auto-fill Content-Type for getfile2\n\n"
-            infoText += "  2. This tab will automatically detect your tag\n\n"
-            infoText += "  3. Click 'Select File' button that appears below\n\n"
-            infoText += "  4. Choose your file from computer\n\n"
-            infoText += "  5. Send request - tag will be replaced with actual file content\n\n"
-            infoText += "=" * 70 + "\n"
-            infoText += "Note: Only tags starting with 'getfile' are supported\n"
-            infoText += "      (getfile, getfile1, getfile2, getfile3, etc.)\n"
-            infoText += "=" * 70 + "\n"
-            self.selectFileButton.setEnabled(False)
-        else:
-            infoText += "\n" + "=" * 70 + "\n"
-            infoText += "   ACTIONS\n"
-            infoText += "=" * 70 + "\n\n"
+            # Refresh this table
+            self.setMessage(self._currentMessage, True)
             
-            # Count how many need file selection
-            needSelection = 0
-            for param in self._currentParams:
-                if param not in BurpExtender.file_mappings:
-                    needSelection += 1
-            
-            if needSelection > 0:
-                infoText += ">>> " + str(needSelection) + " tag(s) need file selection <<<\n\n"
-            
-            infoText += "Click the button below to select/change file for any tag.\n"
-            infoText += "After selecting file, send your request to upload.\n\n"
-            infoText += "=" * 70 + "\n\n\n"
-            
-            # Add Content-Type mapping reference
-            infoText += "=" * 70 + "\n"
-            infoText += "  CONTENT-TYPE MAPPING REFERENCE\n"
-            infoText += "=" * 70 + "\n\n"
-            
-            infoText += "PHP Extensions:\n"
-            infoText += "  .php, .php2-7, .phps, .pht, .phtml -> application/x-httpd-php\n"
-            infoText += "  .inc, .htaccess -> text/plain\n\n"
-            
-            infoText += "ASP Extensions:\n"
-            infoText += "  .asp, .aspx, .aspq -> text/asp\n"
-            infoText += "  .ashx, .asmx, .asa -> text/plain\n"
-            infoText += "  .config -> application/xml\n\n"
-            
-            infoText += "JSP Extensions:\n"
-            infoText += "  .jsp, .jspx, .jsw, .jsv, .jspf -> text/html\n"
-            infoText += "  .do, .action -> text/html\n\n"
-            
-            infoText += "Script Extensions:\n"
-            infoText += "  .py, .py3, .pyw -> text/x-python\n"
-            infoText += "  .sh -> application/x-sh\n"
-            infoText += "  .bat -> application/x-bat\n"
-            infoText += "  .ps1 -> text/plain\n\n"
-            
-            infoText += "Document Extensions:\n"
-            infoText += "  .pdf -> application/pdf\n"
-            infoText += "  .doc -> application/msword\n"
-            infoText += "  .docx -> application/vnd.openxmlformats-officedocument.wordprocessingml.document\n"
-            infoText += "  .xls -> application/vnd.ms-excel\n"
-            infoText += "  .xlsx -> application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\n"
-            infoText += "  .txt -> text/plain\n"
-            infoText += "  .csv -> text/csv\n"
-            infoText += "  .json -> application/json\n"
-            infoText += "  .xml -> application/xml\n\n"
-            
-            infoText += "Image Extensions:\n"
-            infoText += "  .jpg, .jpeg -> image/jpeg\n"
-            infoText += "  .png -> image/png\n"
-            infoText += "  .gif -> image/gif\n"
-            infoText += "  .bmp -> image/bmp\n"
-            infoText += "  .svg -> image/svg+xml\n"
-            infoText += "  .ico -> image/x-icon\n"
-            infoText += "  .tif, .tiff -> image/tiff\n\n"
-            
-            infoText += "Audio Extensions:\n"
-            infoText += "  .mp3 -> audio/mpeg\n"
-            infoText += "  .wav -> audio/wav\n"
-            infoText += "  .aac -> audio/aac\n"
-            infoText += "  .flac -> audio/flac\n"
-            infoText += "  .ogg -> audio/ogg\n"
-            infoText += "  .m4a -> audio/mp4\n\n"
-            
-            infoText += "Video Extensions:\n"
-            infoText += "  .mp4 -> video/mp4\n"
-            infoText += "  .avi -> video/x-msvideo\n"
-            infoText += "  .mkv -> video/x-matroska\n"
-            infoText += "  .mov -> video/quicktime\n"
-            infoText += "  .wmv -> video/x-ms-wmv\n"
-            infoText += "  .flv -> video/x-flv\n"
-            infoText += "  .webm -> video/webm\n"
-            infoText += "  .mpeg, .mpg -> video/mpeg\n\n"
-            
-            infoText += "Archive Extensions:\n"
-            infoText += "  .zip -> application/zip\n"
-            infoText += "  .rar -> application/x-rar-compressed\n"
-            infoText += "  .tar -> application/x-tar\n"
-            infoText += "  .gz -> application/gzip\n"
-            infoText += "  .7z -> application/x-7z-compressed\n"
-            infoText += "  .jar -> application/java-archive\n\n"
-            
-            infoText += "Executable Extensions:\n"
-            infoText += "  .exe -> application/x-msdownload\n"
-            infoText += "  .dll -> application/x-msdownload\n"
-            infoText += "  .msi -> application/x-msi\n\n"
-            
-            infoText += "Other Extensions:\n"
-            infoText += "  .swf -> application/x-shockwave-flash\n"
-            infoText += "  .bin -> application/octet-stream\n"
-            infoText += "  (unknown) -> application/octet-stream\n\n"
-            infoText += "=" * 70 + "\n"
-            
-            self.selectFileButton.setEnabled(True)
-        
-        self._txtInput.setText(self._extender._helpers.stringToBytes(infoText))
-    
-    def formatBytes(self, size):
-        """Format file size in human readable format"""
-        if size < 1024:
-            return str(size) + " bytes"
-        elif size < 1024 * 1024:
-            return str(round(size / 1024.0, 2)) + " KB"
-        elif size < 1024 * 1024 * 1024:
-            return str(round(size / (1024.0 * 1024), 2)) + " MB"
-        else:
-            return str(round(size / (1024.0 * 1024 * 1024), 2)) + " GB"
-    
+            JOptionPane.showMessageDialog(self.panel, "Mapping updated for " + tagName)
+
     def getMessage(self):
-        return self._txtInput.getText()
+        return self._currentMessage
     
     def isModified(self):
-        return self._txtInput.isTextModified()
+        return False
     
     def getSelectedData(self):
-        return self._txtInput.getSelectedText()
+        return None
