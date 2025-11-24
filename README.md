@@ -94,8 +94,51 @@ Content-Type: <@typefile@>
 **Ví dụ JSON Upload (Base64):**
 ```json
 {
+  "name": "report.pdf",
   "file": "<@getfile:base64@>",
   "type": "<@typefile:pdf@>"
+}
+```
+
+**Ví dụ MultiFile Upload:**
+```http
+POST /upload HTTP/1.1
+...
+Content-Type: multipart/form-data; boundary=----Boundary123
+
+------Boundary123
+Content-Disposition: form-data; name="file"; filename="shell.php"
+Content-Type: <@typefile@>
+
+<@getfile@>
+------Boundary123
+Content-Disposition: form-data; name="file"; filename="shell.html"
+Content-Type: <@typefile1@>
+
+<@getfile1@>
+------Boundary123--
+```
+
+**Ví dụ JSON MultiFile Upload (Base64):**
+```json
+{
+  "files": [
+    {
+      "name": "report.pdf",
+      "type": "<@typefile@>",
+      "content": "<@getfile:base64@>"
+    },
+    {
+      "name": "data.xlsx",
+      "type": "<@typefile1@>",
+      "content": "<@getfile1:base64@>"
+    },
+    {
+      "name": "image.png",
+      "type": "<@typefile2@>",
+      "content": "<@getfile2:base64@>"
+    }
+  ]
 }
 ```
 
