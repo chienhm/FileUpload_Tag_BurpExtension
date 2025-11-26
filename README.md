@@ -51,7 +51,7 @@ Giả lập Content-Type của một định dạng cụ thể mà không cần 
 ```
 <@typefile:php@>      -> application/x-httpd-php
 <@typefile:jpg@>      -> image/jpeg
-<@typefile:extxml@>  -> application/octet-stream (nếu không có trong list hỗ trợ)
+<@typefile:extxml@>   -> application/octet-stream (nếu không có trong list hỗ trợ)
 ```
 
 ### 4. **Automatic Content-Length Update**
